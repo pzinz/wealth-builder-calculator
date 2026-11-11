@@ -75,7 +75,7 @@
                     <div class="space-y-2">
                         <label class="text-xs font-bold uppercase tracking-wider text-slate-400">Select or Search ETF / Index Fund</label>
                         <div class="flex gap-2">
-                            <input type="text" id="idxTickerInput" value="SCHG" placeholder="e.g. VTI, VOO, SCHG, FZROX" class="flex-1 px-4 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-white font-semibold focus:outline-none focus:border-indigo-500 transition-colors uppercase">
+                            <input type="text" id="idxTickerInput" value="SCHG" placeholder="Any ticker: FXAIX, VXUS, BND, VTI..." autocomplete="off" spellcheck="false" class="flex-1 px-4 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-white font-semibold focus:outline-none focus:border-indigo-500 transition-colors uppercase">
                             <button onclick="window.fetchYahooFinanceReturn()" class="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 rounded-xl text-white font-semibold text-sm transition-all shadow-md shadow-indigo-600/20">
                                 Fetch Data
                             </button>
@@ -329,6 +329,7 @@
     <script>
         // Database of Preset Tickers & Fallback Values
         const PRESET_TICKERS = {
+            'FXAIX': { name: 'Fidelity 500 Index Fund', rate: 10.8, divYield: 1.4 },
             'FZROX': { name: 'Fidelity ZERO Total Market Index Fund', rate: 10.3, divYield: 1.4 },
             'VTI': { name: 'Vanguard Total Stock Market ETF', rate: 10.2, divYield: 1.4 },
             'VOO': { name: 'Vanguard S&P 500 ETF', rate: 10.8, divYield: 1.4 },
@@ -431,8 +432,14 @@
             }
         };
 
+        // ---- Helpers ----
+        // Escape untrusted text (fund names come back from a third-party proxy)
+        const esc = (s) => String(s).replace(/[&<>"']/g, c => '&#' + c.charCodeAt(0) + ';');
+        const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+
         // Apply Fund Return Parameters
-        window.applyFundReturnData = function(ticker, name, rate, divYield) {
+        // statusHtml (optional) replaces the default green "Loaded..." status line
+        window.applyFundReturnData = function(ticker, name, rate, divYield, statusHtml) {
             const rateInput = document.getElementById('idxRateOfReturn');
             const rateVal = document.getElementById('idxRateVal');
             const divInput = document.getElementById('idxDivYield');
@@ -440,71 +447,133 @@
             const statusText = document.getElementById('tickerStatusText');
             const header = document.getElementById('fundTitleHeader');
 
-            // Format descriptive fund name clean string
-            const displayName = (name && name !== ticker) ? name : (PRESET_TICKERS[ticker]?.name || `${ticker} Index Fund`);
+            const displayName = (name && name !== ticker) ? name : (PRESET_TICKERS[ticker]?.name || '');
 
             if (rateInput) rateInput.value = rate.toFixed(1);
             if (rateVal) rateVal.textContent = `${rate.toFixed(1)}%`;
             if (divInput) divInput.value = divYield.toFixed(1);
             if (divVal) divVal.textContent = `${divYield.toFixed(1)}%`;
-            if (header) header.textContent = `${ticker} - ${displayName}`;
-            if (statusText) statusText.innerHTML = `Loaded <strong class="text-indigo-400">${ticker}</strong> (${displayName}) • <span class="text-emerald-400">${rate.toFixed(1)}% trailing CAGR</span>`;
+            if (header) header.textContent = displayName ? `${ticker} - ${displayName}` : ticker;
+            if (statusText) statusText.innerHTML = statusHtml ||
+                `Loaded <strong class="text-indigo-400">${esc(ticker)}</strong> (${esc(displayName || ticker)}) • <span class="text-emerald-400">${rate.toFixed(1)}% CAGR</span>`;
 
             window.runIndexCalculation();
         };
 
-        // Fetch Live Return Data from Yahoo Finance
+        // Request monthly history + dividends for any Yahoo Finance symbol.
+        // Yahoo blocks direct browser calls (CORS), so race several public proxies in parallel.
+        window.fetchChartData = function(ticker) {
+            const target = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=10y&interval=1mo&events=div&includeAdjustedClose=true`;
+            const urls = [
+                `https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`,
+                `https://corsproxy.io/?${encodeURIComponent(target)}`,
+                `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(target)}`
+            ];
+
+            const tryOne = async (url) => {
+                const ctrl = new AbortController();
+                const timer = setTimeout(() => ctrl.abort(), 9000);
+                try {
+                    const res = await fetch(url, { signal: ctrl.signal });
+                    const body = JSON.parse(await res.text());
+                    if (body?.chart?.error) {
+                        const e = new Error(body.chart.error.description || 'Yahoo error');
+                        e.notFound = /not found|no data/i.test(`${body.chart.error.code} ${body.chart.error.description}`);
+                        throw e;
+                    }
+                    const result = body?.chart?.result?.[0];
+                    if (!result?.timestamp?.length) throw new Error('empty response');
+                    return result;
+                } finally {
+                    clearTimeout(timer);
+                }
+            };
+
+            return Promise.any(urls.map(tryOne));
+        };
+
+        // Turn a Yahoo chart result into CAGR + trailing-12-month dividend yield
+        window.analyzeChart = function(result) {
+            const ts = result.timestamp;
+            const closes = result.indicators?.quote?.[0]?.close || [];
+            const adj = result.indicators?.adjclose?.[0]?.adjclose;
+            const totalReturn = !!(adj && adj.some(p => p > 0));
+            const series = totalReturn ? adj : closes;   // adjusted close includes reinvested dividends
+
+            const valid = (p) => p !== null && p !== undefined && p > 0;
+            const first = series.findIndex(valid);
+            let last = -1;
+            for (let i = series.length - 1; i >= 0; i--) { if (valid(series[i])) { last = i; break; } }
+            if (first < 0 || last <= first) return null;
+
+            const years = (ts[last] - ts[first]) / (365.25 * 24 * 3600);
+            if (years < 0.5) return null;
+            const cagr = (Math.pow(series[last] / series[first], 1 / years) - 1) * 100;
+
+            // Trailing-12-month dividends / latest price
+            let price = result.meta?.regularMarketPrice;
+            if (!valid(price)) {
+                for (let i = closes.length - 1; i >= 0; i--) { if (valid(closes[i])) { price = closes[i]; break; } }
+            }
+            const cutoff = Date.now() / 1000 - 365 * 24 * 3600;
+            const divSum = Object.values(result.events?.dividends || {})
+                .filter(d => d.date >= cutoff)
+                .reduce((sum, d) => sum + (d.amount || 0), 0);
+            const divYield = valid(price) ? (divSum / price) * 100 : 0;
+
+            return { cagr, years, divYield, totalReturn, meta: result.meta };
+        };
+
+        // Look up whatever ticker the user typed
         window.fetchYahooFinanceReturn = async function() {
             const tickerInput = document.getElementById('idxTickerInput');
             if (!tickerInput) return;
-            const ticker = tickerInput.value.trim().toUpperCase() || 'SCHG';
-            
+            const ticker = tickerInput.value.trim().toUpperCase().replace(/[^A-Z0-9.\-^=]/g, '') || 'SCHG';
+            tickerInput.value = ticker;
+
             const statusText = document.getElementById('tickerStatusText');
-            if (statusText) statusText.innerHTML = `Searching live data for <strong class="text-indigo-400">${ticker}</strong>...`;
+            const header = document.getElementById('fundTitleHeader');
+            if (statusText) statusText.innerHTML = `Searching live data for <strong class="text-indigo-400">${esc(ticker)}</strong>...`;
 
-            const targetUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?range=5y&interval=1mo`;
-            const proxies = [
-                `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`,
-                `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`
-            ];
-
-            for (const proxy of proxies) {
-                try {
-                    const response = await fetch(proxy);
-                    let chartData = null;
-
-                    if (proxy.includes('allorigins')) {
-                        const data = await response.json();
-                        chartData = JSON.parse(data.contents);
-                    } else {
-                        chartData = await response.json();
-                    }
-
-                    const result = chartData?.chart?.result?.[0];
-                    const timestamps = result?.timestamp;
-                    const quotes = result?.indicators?.quote?.[0]?.close;
-                    const meta = result?.meta;
-
-                    if (timestamps && quotes && quotes.length > 2) {
-                        const startPrice = quotes.find(p => p !== null && p > 0);
-                        const endPrice = [...quotes].reverse().find(p => p !== null && p > 0);
-                        const years = (timestamps[timestamps.length - 1] - timestamps[0]) / (365.25 * 24 * 3600);
-
-                        const cagr = (Math.pow(endPrice / startPrice, 1 / years) - 1) * 100;
-                        const fundName = meta?.longName || meta?.shortName || PRESET_TICKERS[ticker]?.name || `${ticker} Index Fund`;
-                        const defaultDiv = PRESET_TICKERS[ticker]?.divYield || 1.4;
-                        
-                        window.applyFundReturnData(ticker, fundName, Math.min(Math.max(cagr, 1), 30), defaultDiv);
-                        return;
-                    }
-                } catch (err) {
-                    console.log(`Proxy failed for ${ticker}, attempting next fallback...`);
-                }
+            let stats = null;
+            let failure = 'network';
+            try {
+                const result = await window.fetchChartData(ticker);
+                stats = window.analyzeChart(result);
+                if (!stats) failure = 'history';
+            } catch (err) {
+                const errs = err?.errors || [err];
+                failure = errs.some(e => e?.notFound) ? 'notfound' : 'network';
             }
 
-            // Fallback dataset if API fails or network blocks requests
-            const info = PRESET_TICKERS[ticker] || { name: `${ticker} Index Fund`, rate: 10.5, divYield: 1.4 };
-            window.applyFundReturnData(ticker, info.name, info.rate, info.divYield);
+            if (stats) {
+                const name = stats.meta?.longName || stats.meta?.shortName || PRESET_TICKERS[ticker]?.name || '';
+                const rate = clamp(stats.cagr, 1, 25);            // matches slider range
+                const div = clamp(stats.divYield, 0, 8);
+                const capped = rate !== stats.cagr ? ', capped to slider range' : '';
+                const basis = stats.totalReturn ? 'total-return' : 'price-only';
+                window.applyFundReturnData(ticker, name, rate, div,
+                    `Live data for <strong class="text-indigo-400">${esc(ticker)}</strong> • <span class="text-emerald-400">${rate.toFixed(1)}% ${basis} CAGR (${stats.years.toFixed(1)} yrs${capped})</span> • ${div.toFixed(1)}% trailing yield`);
+                return;
+            }
+
+            // Lookup failed: say so instead of pretending it loaded
+            const reasons = {
+                notfound: `Couldn't find a fund with ticker <strong>${esc(ticker)}</strong>. Check the symbol.`,
+                history: `Not enough price history for <strong>${esc(ticker)}</strong> to calculate a return.`,
+                network: `Live lookup for <strong>${esc(ticker)}</strong> was blocked or timed out.`
+            };
+            const preset = PRESET_TICKERS[ticker];
+
+            if (preset && failure !== 'notfound') {
+                window.applyFundReturnData(ticker, preset.name, preset.rate, preset.divYield,
+                    `<span class="text-amber-400">${reasons[failure]} Showing a saved estimate (${preset.rate.toFixed(1)}% return, ${preset.divYield.toFixed(1)}% yield), not live data.</span>`);
+            } else if (failure === 'notfound') {
+                if (statusText) statusText.innerHTML = `<span class="text-amber-400">${reasons.notfound} Sliders unchanged.</span>`;
+            } else {
+                if (header) header.textContent = `${ticker} - manual inputs`;
+                if (statusText) statusText.innerHTML = `<span class="text-amber-400">${reasons[failure]} Set the expected return and dividend yield with the sliders.</span>`;
+            }
         };
 
         // Main Index Fund Calculation Engine
@@ -823,6 +892,10 @@
                     el.addEventListener('input', window.runRetirementCalculation);
                     el.addEventListener('change', window.runRetirementCalculation);
                 }
+            });
+
+            document.getElementById('idxTickerInput')?.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') window.fetchYahooFinanceReturn();
             });
 
             // Initial Calculations
